@@ -1,6 +1,6 @@
 # Windows Security Checker
 
-一个只读的 Windows 主机安全基线与应急排查工具，兼容 Windows PowerShell 5.1+。它会汇总关键安全配置和可疑迹象，并输出控制台、JSON 或 HTML 报告。
+一个 Windows 主机安全基线、应急排查和受控修复工具，兼容 Windows PowerShell 5.1+。支持控制台、JSON、HTML 报告，以及带备份、预演和复检的一键修复。
 
 ## 检查项目
 
@@ -19,52 +19,114 @@
 - 高关注端口监听
 - 最近 Windows 登录失败事件（4625）
 
-## 快速开始
+## 快速检查
 
-请使用 **64 位管理员 PowerShell** 运行，以便读取完整的系统配置和 Security 事件日志。
+请使用 **64 位管理员 PowerShell** 运行，以便读取完整配置和 Security 事件日志。
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\Invoke-WindowsSecurityCheck.ps1
 ```
 
-同时生成 JSON 和 HTML 报告：
+生成 JSON 和 HTML 报告：
 
 ```powershell
 .\Invoke-WindowsSecurityCheck.ps1 -Format All -OutputDirectory .\reports
 ```
 
-检查最近 72 小时的登录失败：
+## 一键修复
+
+先预演，不修改系统：
 
 ```powershell
-.\Invoke-WindowsSecurityCheck.ps1 -FailedLogonHours 72 -Format Html
+.\Invoke-WindowsSecurityCheck.ps1 -Repair -RepairProfile Safe -WhatIf
 ```
 
-也可以作为模块使用：
+执行安全修复，自动确认并在完成后复检：
+
+```powershell
+.\Invoke-WindowsSecurityCheck.ps1 -Repair -RepairProfile Safe -Force -Format All
+```
+
+更严格的加固：
+
+```powershell
+.\Invoke-WindowsSecurityCheck.ps1 -Repair -RepairProfile Harden -Force -Format All
+```
+
+### 修复档位
+
+| 档位 | 自动操作 |
+| --- | --- |
+| `Safe` | 禁用 Guest、启用域/专用/公用防火墙、禁用 SMBv1 |
+| `Harden` | 包含 `Safe`，并关闭远程桌面、清除当前用户和 WinHTTP 代理 |
+
+`Harden` 可能中断远程桌面和依赖代理的网络访问。远程管理主机应先使用 `-WhatIf`，并确保有控制台或其他恢复通道。
+
+默认情况下，修复前会创建 `security-backup-时间戳` 目录，包含：
+
+- 远程桌面、SMB 和用户代理注册表导出
+- Windows 防火墙策略
+- WinHTTP 代理状态
+- hosts 文件副本
+- 备份元数据
+- 修复完成后的 `repair-result.json`
+
+指定备份路径：
+
+```powershell
+.\Invoke-WindowsSecurityCheck.ps1 -Repair -Force -BackupDirectory C:\SecurityBackup
+```
+
+跳过修复后复检：
+
+```powershell
+.\Invoke-WindowsSecurityCheck.ps1 -Repair -Force -NoRecheck
+```
+
+## 不自动处理的项目
+
+以下项目依赖业务用途或调查结论，不会被工具直接删除或终止：
+
+- 管理员组成员
+- 共享目录
+- 启动项和计划任务
+- 可疑进程
+- DNS 和 hosts 映射
+- 监听端口及其服务
+- 登录失败记录
+
+这些项目会继续出现在报告中，并给出人工处置建议。
+
+## 模块调用
 
 ```powershell
 Import-Module .\WindowsSecurityChecker.psm1
 $report = Invoke-WindowsSecurityCheck -Format Json
-$report.Findings | Where-Object Status -in 'Critical', 'Warning'
+$repair = Invoke-WindowsSecurityRepair -Profile Safe -WhatIf
 ```
 
 ## 状态说明
 
+检查状态包括 `Critical`、`Warning`、`Pass`、`Info` 和 `Error`。
+
+修复状态包括：
+
 | 状态 | 含义 |
 | --- | --- |
-| `Critical` | 明显扩大攻击面或达到高风险阈值，应优先复核 |
-| `Warning` | 存在配置、暴露面或启发式命中，需要人工确认 |
-| `Pass` | 未发现该项风险 |
-| `Info` | 资产清单类信息，或风险依赖具体业务环境 |
-| `Error` | 权限不足、组件不可用或检查执行失败 |
+| `Fixed` | 已完成修改 |
+| `NoChange` | 当前配置已符合目标 |
+| `Planned` | `-WhatIf` 预演中计划执行 |
+| `Skipped` | 未找到目标或不适用 |
+| `Failed` | 单项修复失败，其他项目继续执行 |
 
 ## 注意事项
 
-- 工具只读取配置，不会自动修改系统。
-- “可疑进程”和部分启动项判断基于命令行及路径启发式，可能产生误报。
-- 端口处于监听状态不等于可从外网访问，还需结合 Windows 防火墙和边界网络策略判断。
-- 在域环境中，本地策略可能被组策略覆盖。
-- JSON 报告可能包含账号、路径、IP 和命令行等敏感信息，请妥善保存。
+- 修复模式必须使用管理员 PowerShell，`-WhatIf` 预演除外。
+- SMBv1 组件变更可能需要重启。
+- 工具不会保证符合某个特定行业合规标准。
+- 在域环境中，本地设置可能被组策略再次覆盖。
+- 报告和备份可能包含账号、路径、IP、命令行和网络配置等敏感信息。
 
 ## 测试
 
