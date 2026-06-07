@@ -1,6 +1,6 @@
 ﻿Set-StrictMode -Version 2.0
 
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.1.0'
 
 function New-SecurityFinding {
     param(
@@ -29,6 +29,57 @@ function Test-IsAdministrator {
     catch {
         return $false
     }
+}
+
+function New-RepairResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Item,
+        [Parameter(Mandatory = $true)][ValidateSet('Fixed', 'Skipped', 'Failed', 'NoChange', 'Planned')][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [bool]$RestartRequired = $false
+    )
+
+    [pscustomobject]@{
+        Item            = $Item
+        Status          = $Status
+        Message         = $Message
+        RestartRequired = $RestartRequired
+    }
+}
+
+function Backup-SecurityConfiguration {
+    param([Parameter(Mandatory = $true)][string]$BackupDirectory)
+
+    if (-not (Test-Path -LiteralPath $BackupDirectory)) {
+        New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
+    }
+
+    $metadata = [ordered]@{
+        ComputerName = $env:COMPUTERNAME
+        CreatedAt    = (Get-Date).ToString('o')
+        ToolVersion  = $script:ToolVersion
+    }
+    $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $BackupDirectory 'metadata.json') -Encoding UTF8
+
+    $registryBackups = @(
+        @{ Key = 'HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server'; File = 'terminal-server.reg' },
+        @{ Key = 'HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; File = 'smb-server.reg' },
+        @{ Key = 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; File = 'internet-settings.reg' }
+    )
+    foreach ($backup in $registryBackups) {
+        & reg.exe export $backup.Key (Join-Path $BackupDirectory $backup.File) /y 2>$null | Out-Null
+    }
+
+    & netsh advfirewall export (Join-Path $BackupDirectory 'firewall-policy.wfw') 2>$null | Out-Null
+    & netsh winhttp show proxy 2>&1 |
+        Set-Content -LiteralPath (Join-Path $BackupDirectory 'winhttp-proxy.txt') -Encoding UTF8
+
+    $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    if (Test-Path -LiteralPath $hostsPath) {
+        Copy-Item -LiteralPath $hostsPath -Destination (Join-Path $BackupDirectory 'hosts') -Force
+    }
+
+    return $BackupDirectory
 }
 
 function Get-CommandLineRisk {
@@ -534,6 +585,238 @@ $($cards -join "`n")
 "@
 }
 
+function Invoke-WindowsSecurityRepair {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [ValidateSet('Safe', 'Harden')]
+        [string]$Profile = 'Safe',
+
+        [string]$BackupDirectory = (Join-Path (Get-Location) ("security-backup-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))),
+
+        [switch]$Force
+    )
+
+    if (-not (Test-IsAdministrator) -and -not $WhatIfPreference) {
+        throw '修复操作需要管理员权限。请以管理员身份启动 64 位 PowerShell 后重试。'
+    }
+
+    if ($Force) {
+        $ConfirmPreference = 'None'
+    }
+
+    $isWhatIf = [bool]$WhatIfPreference
+    $backupPath = $null
+    if ($isWhatIf) {
+        Write-Host "WhatIf：将把配置备份到 $BackupDirectory" -ForegroundColor Cyan
+    }
+    elseif ($PSCmdlet.ShouldProcess($env:COMPUTERNAME, "备份当前安全配置到 $BackupDirectory")) {
+        $backupPath = Backup-SecurityConfiguration -BackupDirectory $BackupDirectory
+        Write-Host "配置备份：$backupPath" -ForegroundColor Cyan
+    }
+
+    $results = @()
+
+    try {
+        $guest = $null
+        if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+            $guest = Get-LocalUser -ErrorAction SilentlyContinue |
+                Where-Object { [string]$_.SID -like '*-501' } |
+                Select-Object -First 1
+        }
+        if (-not $guest) {
+            $guest = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE '%-501'" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
+        $guestEnabled = $guest -and (
+            ($guest.PSObject.Properties['Enabled'] -and [bool]$guest.Enabled) -or
+            ($guest.PSObject.Properties['Disabled'] -and -not [bool]$guest.Disabled)
+        )
+        if (-not $guest) {
+            $results += New-RepairResult -Item 'Guest 账号' -Status 'Skipped' -Message '未找到内置 Guest 账号。'
+        }
+        elseif (-not $guestEnabled) {
+            $results += New-RepairResult -Item 'Guest 账号' -Status 'NoChange' -Message 'Guest 已禁用。'
+        }
+        elseif ($PSCmdlet.ShouldProcess($guest.Name, '禁用内置 Guest 账号')) {
+            if (Get-Command Disable-LocalUser -ErrorAction SilentlyContinue) {
+                Disable-LocalUser -Name $guest.Name -ErrorAction Stop
+            }
+            else {
+                & net.exe user $guest.Name /active:no | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "net user 返回退出码 $LASTEXITCODE" }
+            }
+            $results += New-RepairResult -Item 'Guest 账号' -Status 'Fixed' -Message '已禁用 Guest。'
+        }
+        else {
+            $results += New-RepairResult -Item 'Guest 账号' -Status 'Planned' -Message '将禁用 Guest。'
+        }
+    }
+    catch {
+        $results += New-RepairResult -Item 'Guest 账号' -Status 'Failed' -Message $_.Exception.Message
+    }
+
+    try {
+        $disabledProfiles = @()
+        if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
+            $disabledProfiles = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { -not $_.Enabled })
+        }
+        if ($disabledProfiles.Count -eq 0) {
+            $results += New-RepairResult -Item 'Windows 防火墙' -Status 'NoChange' -Message '所有防火墙配置文件均已启用。'
+        }
+        elseif ($PSCmdlet.ShouldProcess('Domain, Private, Public', '启用 Windows 防火墙')) {
+            Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -ErrorAction Stop
+            $results += New-RepairResult -Item 'Windows 防火墙' -Status 'Fixed' -Message '已启用所有防火墙配置文件。'
+        }
+        else {
+            $results += New-RepairResult -Item 'Windows 防火墙' -Status 'Planned' -Message '将启用所有防火墙配置文件。'
+        }
+    }
+    catch {
+        $results += New-RepairResult -Item 'Windows 防火墙' -Status 'Failed' -Message $_.Exception.Message
+    }
+
+    try {
+        $smb1Enabled = $false
+        $smbStateUnknown = $false
+        $feature = $null
+        if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+            try {
+                $feature = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop
+                $smb1Enabled = $feature -and $feature.State -eq 'Enabled'
+            }
+            catch {
+                $smbStateUnknown = $true
+            }
+        }
+        $server = $null
+        if (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue) {
+            try {
+                $server = Get-SmbServerConfiguration -ErrorAction Stop
+                $smb1Enabled = $smb1Enabled -or ($server -and $server.EnableSMB1Protocol)
+            }
+            catch {
+                $smbStateUnknown = $true
+            }
+        }
+        $reg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name SMB1 -ErrorAction SilentlyContinue
+        $smb1Enabled = $smb1Enabled -or ($reg -and $reg.SMB1 -eq 1)
+
+        if (-not $smb1Enabled -and -not $smbStateUnknown) {
+            $results += New-RepairResult -Item 'SMBv1' -Status 'NoChange' -Message 'SMBv1 未启用。'
+        }
+        elseif ($smbStateUnknown -and -not $isWhatIf) {
+            throw '无法完整读取 SMBv1 状态，未执行不完整的修复。'
+        }
+        elseif ($PSCmdlet.ShouldProcess('SMBv1 client/server components', '禁用 SMBv1')) {
+            $restartRequired = $false
+            if ($server -and $server.EnableSMB1Protocol) {
+                Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
+            }
+            New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' `
+                -Name SMB1 -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+            if ($feature -and $feature.State -eq 'Enabled') {
+                $disableResult = Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop
+                $restartRequired = [bool]$disableResult.RestartNeeded
+            }
+            $results += New-RepairResult -Item 'SMBv1' -Status 'Fixed' -Message '已禁用 SMBv1。' `
+                -RestartRequired $restartRequired
+        }
+        else {
+            $message = if ($smbStateUnknown) { '将以管理员权限确认并禁用 SMBv1。' } else { '将禁用 SMBv1。' }
+            $results += New-RepairResult -Item 'SMBv1' -Status 'Planned' -Message $message -RestartRequired $true
+        }
+    }
+    catch {
+        $results += New-RepairResult -Item 'SMBv1' -Status 'Failed' -Message $_.Exception.Message
+    }
+
+    if ($Profile -eq 'Harden') {
+        try {
+            $rdpPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+            $rdpEnabled = (Get-ItemProperty -Path $rdpPath -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections -eq 0
+            if (-not $rdpEnabled) {
+                $results += New-RepairResult -Item '远程桌面' -Status 'NoChange' -Message '远程桌面已关闭。'
+            }
+            elseif ($PSCmdlet.ShouldProcess('Remote Desktop', '关闭远程桌面连接')) {
+                Set-ItemProperty -Path $rdpPath -Name fDenyTSConnections -Type DWord -Value 1 -ErrorAction Stop
+                $results += New-RepairResult -Item '远程桌面' -Status 'Fixed' -Message '已关闭远程桌面。'
+            }
+            else {
+                $results += New-RepairResult -Item '远程桌面' -Status 'Planned' -Message '将关闭远程桌面。'
+            }
+        }
+        catch {
+            $results += New-RepairResult -Item '远程桌面' -Status 'Failed' -Message $_.Exception.Message
+        }
+
+        try {
+            $proxyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+            $proxy = Get-ItemProperty -Path $proxyPath -ErrorAction Stop
+            $proxyEnabled = $proxy.PSObject.Properties['ProxyEnable'] -and [bool]$proxy.ProxyEnable
+            $hasProxyServer = $proxy.PSObject.Properties['ProxyServer'] -and -not [string]::IsNullOrWhiteSpace($proxy.ProxyServer)
+            $hasAutoConfig = $proxy.PSObject.Properties['AutoConfigURL'] -and -not [string]::IsNullOrWhiteSpace($proxy.AutoConfigURL)
+            $winHttpRaw = (& netsh winhttp show proxy 2>&1 | Out-String)
+            $hasWinHttpProxy = $winHttpRaw -notmatch '(?i)direct access|直接访问'
+            if (-not ($proxyEnabled -or $hasProxyServer -or $hasAutoConfig -or $hasWinHttpProxy)) {
+                $results += New-RepairResult -Item '代理配置' -Status 'NoChange' -Message '未检测到显式代理。'
+            }
+            elseif ($PSCmdlet.ShouldProcess('Current user and WinHTTP proxy', '清除代理配置')) {
+                Set-ItemProperty -Path $proxyPath -Name ProxyEnable -Type DWord -Value 0 -ErrorAction Stop
+                Remove-ItemProperty -Path $proxyPath -Name ProxyServer -ErrorAction SilentlyContinue
+                Remove-ItemProperty -Path $proxyPath -Name AutoConfigURL -ErrorAction SilentlyContinue
+                & netsh winhttp reset proxy | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "netsh winhttp 返回退出码 $LASTEXITCODE" }
+                $results += New-RepairResult -Item '代理配置' -Status 'Fixed' -Message '已清除当前用户和 WinHTTP 代理。'
+            }
+            else {
+                $results += New-RepairResult -Item '代理配置' -Status 'Planned' -Message '将清除当前用户和 WinHTTP 代理。'
+            }
+        }
+        catch {
+            $results += New-RepairResult -Item '代理配置' -Status 'Failed' -Message $_.Exception.Message
+        }
+    }
+
+    $summary = [ordered]@{}
+    foreach ($status in @('Fixed', 'NoChange', 'Planned', 'Skipped', 'Failed')) {
+        $summary[$status] = @($results | Where-Object { $_.Status -eq $status }).Count
+    }
+
+    $repairReport = [pscustomobject]@{
+        ToolVersion     = $script:ToolVersion
+        ComputerName    = $env:COMPUTERNAME
+        GeneratedAt     = (Get-Date).ToString('o')
+        Profile         = $Profile
+        WhatIf          = $isWhatIf
+        BackupDirectory = $backupPath
+        RestartRequired = @($results | Where-Object { $_.RestartRequired }).Count -gt 0
+        Summary         = [pscustomobject]$summary
+        Results         = $results
+    }
+
+    if ($backupPath) {
+        $repairReport | ConvertTo-Json -Depth 6 |
+            Set-Content -LiteralPath (Join-Path $backupPath 'repair-result.json') -Encoding UTF8
+    }
+
+    Write-Host "`nWindows Security Repair ($Profile)" -ForegroundColor Cyan
+    foreach ($result in $results) {
+        $color = switch ($result.Status) {
+            'Fixed' { 'Green' }
+            'NoChange' { 'DarkGreen' }
+            'Planned' { 'Cyan' }
+            'Skipped' { 'Yellow' }
+            default { 'Red' }
+        }
+        Write-Host ("[{0,-8}] {1}: {2}" -f $result.Status, $result.Item, $result.Message) -ForegroundColor $color
+    }
+    if ($repairReport.RestartRequired) {
+        Write-Host '部分修复需要重启 Windows 后完全生效。' -ForegroundColor Yellow
+    }
+
+    return $repairReport
+}
+
 function Invoke-WindowsSecurityCheck {
     [CmdletBinding()]
     param(
@@ -608,4 +891,4 @@ function Invoke-WindowsSecurityCheck {
     return $report
 }
 
-Export-ModuleMember -Function Invoke-WindowsSecurityCheck
+Export-ModuleMember -Function Invoke-WindowsSecurityCheck, Invoke-WindowsSecurityRepair
