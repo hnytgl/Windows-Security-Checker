@@ -1,0 +1,7 @@
+reports/
+work/
+outputs/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
